@@ -1,4 +1,9 @@
 import boto3
+import logging
+
+from s3_browser import paths
+
+logger = logging.getLogger(__name__)
 
 
 class S3Client(object):
@@ -11,10 +16,10 @@ class S3Client(object):
         self.boto = boto3.client('s3')
         self.path_cache = {}
 
-    # FIXME: rm
-    def _debug(self, msg):
-        with open('/tmp/s3-client-debug.log', 'a') as f:
-            f.write(msg + '\n')
+    def clear_cache(self):
+        size = len(self.path_cache)
+        self.path_cache = {}
+        return size
 
     def ls(self, path, path_fragment=False):
         """
@@ -22,18 +27,29 @@ class S3Client(object):
 
         :type path: s3_browser.paths.S3Path
         """
-        self._debug('ls called: {}, {}'.format(path, path_fragment))
+        logger.debug('ls called: %s, %s', path, path_fragment)
         cache_key = (str(path), path_fragment)
         cached = self.path_cache.get(cache_key)
+
         if cached is not None:
+            logger.debug('cache hit')
             return cached
 
+        logger.debug('cache miss')
+
         def _fetch():
-            if not path.bucket:
-                return [
-                    b['Name']
+            if not path.bucket or not path.path and path_fragment:
+                logger.debug('Listing buckets')
+                res = [
+                    paths.S3Bucket(b['Name'])
                     for b in self.boto.list_buckets().get('Buckets', [])
                 ]
+                if path.bucket:
+                    logger.debug('Trimming bucket list: "%s"', path.bucket)
+                    res = [r for r in res if r.bucket.startswith(path.bucket)]
+
+                logger.debug('Found buckets: %s', [str(r) for r in res])
+                return res
 
             if not path_fragment:
                 search_path = path.path + '/' if path.path else ''
@@ -43,10 +59,9 @@ class S3Client(object):
             last_slash = search_path.rfind('/')
             search_len = last_slash + 1 if last_slash != -1 else 0
 
-            self._debug(
-                'Listing objects. full path: "{}", search_path: "{}"'.format(
-                    path, search_path
-                )
+            logger.debug(
+                'Listing objects. full path: "%s", search_path: "%s"',
+                path, search_path
             )
             # TODO: [ab]use pagination (see boto/boto3#134)
             res = self.boto.list_objects(
@@ -54,17 +69,18 @@ class S3Client(object):
                 Prefix=search_path,
                 Delimiter='/'
             )
-            # TODO: Mark prefixes vs keys, and store modified date with key
             prefixes = [
-                r['Prefix'][search_len:]
+                paths.S3Prefix(r['Prefix'][search_len:])
                 for r in res.get('CommonPrefixes', [])
             ]
             keys = [
-                r['Key'][search_len:] for r in res.get('Contents', [])
+                paths.S3Key(r['Key'][search_len:], r['LastModified'])
+                for r in res.get('Contents', [])
                 if r['Key'] != search_path
             ]
-            self._debug(
-                'Results: {} -- {}'.format(prefixes, keys)
+            logger.debug(
+                'results: prefixes: %s -- keys: %s',
+                [str(p) for p in prefixes], [str(k) for k in keys]
             )
             return prefixes + keys
 
@@ -74,5 +90,17 @@ class S3Client(object):
 
         return res
 
+    def head(self, path):
+        """Get head metadata for a path"""
+        res = None
+        if not path.path:
+            res = self.boto.head_bucket(Bucket=path.bucket)
+        else:
+            res = self.boto.head_object(Bucket=path.bucket, Key=path.path)
+
+        logger.debug('Head %s: response = %s', path, res)
+        return res
+
     def is_path(self, path):
+        # TODO: Do this with head_object instead?
         return bool(self.ls(path))
